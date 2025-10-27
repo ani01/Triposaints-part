@@ -2,7 +2,6 @@ import express from "express";
 import passport from "passport";
 import session from "express-session";
 import { Strategy as FacebookStrategy } from "passport-facebook";
-import { Strategy as InstagramStrategy } from "passport-instagram";
 import dotenv from "dotenv";
 import cors from "cors";
 
@@ -56,29 +55,6 @@ passport.use(
   )
 );
 
-// Instagram Strategy
-passport.use(
-  new InstagramStrategy(
-    {
-      clientID: process.env.INSTAGRAM_CLIENT_ID,
-      clientSecret: process.env.INSTAGRAM_CLIENT_SECRET,
-      callbackURL: `${process.env.BACKEND_URL || "http://localhost:5000"}/auth/instagram/callback`,
-    },
-    (accessToken, refreshToken, profile, done) => {
-      try {
-        console.log("✅ Instagram authentication successful");
-        console.log("User Profile:", profile);
-        profile.accessToken = accessToken;
-        profile.provider = "instagram";
-        return done(null, profile);
-      } catch (error) {
-        console.error("❌ Error in Instagram strategy:", error);
-        return done(error, null);
-      }
-    }
-  )
-);
-
 passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((obj, done) => done(null, obj));
 
@@ -105,51 +81,134 @@ app.get(
   }
 );
 
-// Instagram OAuth routes
-app.get(
-  "/auth/instagram",
-  passport.authenticate("instagram", {
-    scope: ["user_profile", "user_media"],
-  })
-);
+// Instagram OAuth - Manual implementation using Instagram Basic Display API
+app.get("/auth/instagram", (req, res) => {
+  const redirectUri = `${process.env.BACKEND_URL || "http://localhost:5000"}/auth/instagram/callback`;
+  console.log("🔍 Instagram Auth - Redirect URI:", redirectUri);
+  console.log("🔍 Instagram Client ID:", process.env.INSTAGRAM_CLIENT_ID);
+  
+  const instagramAuthUrl = `https://api.instagram.com/oauth/authorize?client_id=${process.env.INSTAGRAM_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=user_profile,user_media&response_type=code`;
+  
+  console.log("🔗 Redirecting to:", instagramAuthUrl);
+  res.redirect(instagramAuthUrl);
+});
 
-app.get(
-  "/auth/instagram/callback",
-  passport.authenticate("instagram", {
-    failureRedirect: `${process.env.FRONTEND_URL || "http://localhost:3000"}?error=auth_failed`,
-  }),
-  (req, res) => {
+app.get("/auth/instagram/callback", async (req, res) => {
+  const { code, error, error_reason, error_description } = req.query;
+
+  console.log("📥 Instagram callback received");
+  console.log("Query params:", req.query);
+
+  if (error) {
+    console.error("❌ Instagram OAuth error:", error);
+    console.error("Error reason:", error_reason);
+    console.error("Error description:", error_description);
+    return res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}?error=auth_failed&reason=${error_reason}`);
+  }
+
+  if (!code) {
+    console.error("❌ No authorization code received");
+    return res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}?error=auth_failed`);
+  }
+
+  try {
+    const redirectUri = `${process.env.BACKEND_URL || "http://localhost:5000"}/auth/instagram/callback`;
+    
+    console.log("🔄 Exchanging code for token...");
+    console.log("Redirect URI:", redirectUri);
+    console.log("Client ID:", process.env.INSTAGRAM_CLIENT_ID);
+    
+    // Exchange code for access token
+    const tokenResponse = await fetch("https://api.instagram.com/oauth/access_token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        client_id: process.env.INSTAGRAM_CLIENT_ID,
+        client_secret: process.env.INSTAGRAM_CLIENT_SECRET,
+        grant_type: "authorization_code",
+        redirect_uri: redirectUri,
+        code: code,
+      }),
+    });
+
+    const tokenText = await tokenResponse.text();
+    console.log("📝 Token response status:", tokenResponse.status);
+    console.log("📝 Token response:", tokenText);
+
+    if (!tokenResponse.ok) {
+      let errorData;
+      try {
+        errorData = JSON.parse(tokenText);
+      } catch {
+        errorData = { error: tokenText };
+      }
+      console.error("❌ Token exchange failed:", errorData);
+      throw new Error(`Failed to exchange code for token: ${JSON.stringify(errorData)}`);
+    }
+
+    const tokenData = JSON.parse(tokenText);
+    const { access_token, user_id } = tokenData;
+
+    console.log("✅ Token received for user:", user_id);
+
+    // Get long-lived token (60 days instead of 1 hour)
+    console.log("🔄 Exchanging for long-lived token...");
+    const longLivedTokenResponse = await fetch(
+      `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${process.env.INSTAGRAM_CLIENT_SECRET}&access_token=${access_token}`
+    );
+
+    const longLivedText = await longLivedTokenResponse.text();
+    console.log("📝 Long-lived token response:", longLivedText);
+    
+    let longLivedToken = access_token;
     try {
+      const longLivedTokenData = JSON.parse(longLivedText);
+      longLivedToken = longLivedTokenData.access_token || access_token;
+      console.log("✅ Long-lived token obtained");
+    } catch (e) {
+      console.warn("⚠️  Could not get long-lived token, using short-lived token");
+    }
+
+    // Fetch user profile
+    console.log("📥 Fetching user profile...");
+    const profileResponse = await fetch(
+      `https://graph.instagram.com/${user_id}?fields=id,username,account_type,media_count&access_token=${longLivedToken}`
+    );
+
+    const profileText = await profileResponse.text();
+    console.log("📝 Profile response:", profileText);
+    const profileData = JSON.parse(profileText);
+
+    // Create user object
+    const user = {
+      id: profileData.id,
+      username: profileData.username,
+      displayName: profileData.username,
+      provider: "instagram",
+      accessToken: longLivedToken,
+      accountType: profileData.account_type,
+      mediaCount: profileData.media_count,
+      _json: profileData,
+    };
+
+    // Store user in session
+    req.login(user, (err) => {
+      if (err) {
+        console.error("❌ Session login error:", err);
+        return res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}?error=session_error`);
+      }
+
       console.log("✅ Instagram user authenticated successfully");
       res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}/dashboard`);
-    } catch (error) {
-      console.error("❌ Error in Instagram callback:", error);
-      res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}?error=callback_error`);
-    }
-  }
-);
-
-// Get current user session
-app.get("/auth/user", (req, res) => {
-  if (req.isAuthenticated()) {
-    const userData = {
-      id: req.user.id,
-      displayName: req.user.displayName || req.user.username,
-      email: req.user.emails?.[0]?.value || null,
-      photo: req.user.photos?.[0]?.value || req.user._json?.profile_picture || null,
-      provider: req.user.provider || "facebook",
-      username: req.user.username || null,
-    };
-    res.json({
-      success: true,
-      user: userData,
     });
-  } else {
-    res.status(401).json({ success: false, message: "Not authenticated" });
+  } catch (error) {
+    console.error("❌ Error in Instagram callback:", error);
+    res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}?error=callback_error`);
   }
 });
 
-// Get Instagram user media (posts)
 app.get("/auth/instagram/media", async (req, res) => {
   if (!req.isAuthenticated() || req.user.provider !== "instagram") {
     return res.status(401).json({ 
